@@ -1,0 +1,241 @@
+---
+title: "Simulation"
+author: "Kayla Scharfstein"
+date: "10/31/2024"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+set.seed(528)
+```
+
+```{r}
+library(ggplot2)
+library(gtools)
+library(purrr)
+library(tidyr)
+library(dplyr)
+library(parallel)
+library(foreach)
+library(doParallel)
+library(pracma)
+library(VGAM)
+library(mvtnorm)
+library(ggpubr)
+```
+
+```{r}
+numCores = detectCores()
+```
+
+```{r}
+# log pmf of discretized log normal
+h.p_fun = function(t, mu=5, sigma=1) {
+  return(plnorm(t + 1, meanlog=mu, sdlog=sigma) - plnorm(t, meanlog=mu, sdlog=sigma))
+}
+
+# upper tail of discretized log normal
+h.c_fun = function(t, mu=5, sigma=1) {
+  return(plnorm(t, lower.tail=FALSE, meanlog=mu, sdlog=sigma))
+}
+
+skorski = function(t, t_0, alpha, delta, h.p, h.c) {
+  beta = (t+1)*(1-alpha-4*(2*alpha-1)*log(h.p(t))/(3*(t+3))+
+                  sqrt(-2*alpha*(1-alpha)*log(h.p(t))/(t+2))+
+                  sqrt(pi*alpha*(1-alpha)/(2*(t+2)))*h.c(t_0))
+  return(ifelse(beta >= (t+1)*(1-alpha), ceiling(beta), Inf))
+}
+
+psi = function(x, p) {
+  return(p*log(p/x) + (1-p)*log((1-p)/(1-x)))
+}
+
+dumbgen = function(t, t_0, alpha, delta, h.p, h.c, x_grid_size=10) {
+  s = max(t_0, ceiling((t+1)*(1-alpha)))
+  if (t < s) {
+    return(Inf)
+  } else {
+    for (beta in s:t) {
+      p = beta/(t+1)
+      if (any(psi(seq(1-alpha, p, length.out=x_grid_size), p) >= 
+              (log(2*h.c(t_0)/delta) - log(h.p(t)))/(t+1))) {
+        return(beta)
+      }
+    }
+  } 
+  return(Inf)
+}
+
+split = function(t, t_0, alpha, delta) {
+  return(ceiling((t + 1)*(1-alpha)))
+}
+```
+
+```{r}
+# simulation parameters
+n_train = 50000
+n_test = 50000
+n_conformal = 50000
+d = 10
+alpha = 0.1
+delta = 0.1
+true_coef = c(1, 1, 2, 3, -1, -2, -3, 1, 2, 3, -1)
+mu = function(X) {X %*% true_coef}
+residual_fun = function(z_true, z_pred) {return(abs(z_true - z_pred))}
+```
+
+```{r}
+X_train = rmvnorm(n_train, mean=rep(0, d), sigma=diag(d))
+X_train = cbind(rep(1, n_train), X_train)
+epsilon_train = rnorm(n_train)
+y_train = mu(X_train) + epsilon_train
+train_df = as.data.frame(cbind(X_train, y_train))
+X_test = rmvnorm(n_test, mean=rep(0, d), sigma=diag(d))
+X_test = cbind(rep(1, n_test), X_test)
+epsilon_test = rnorm(n_test)
+y_test = mu(X_test) + epsilon_test
+test_df = as.data.frame(cbind(X_test, y_test))
+X_conformal = rmvnorm(n_conformal, mean=rep(0, d), sigma=diag(d))
+X_conformal = cbind(rep(1, n_conformal), X_conformal)
+epsilon_conformal = rnorm(n_conformal)
+y_conformal = mu(X_conformal) + epsilon_conformal
+conformal_df = as.data.frame(cbind(X_conformal, y_conformal))
+```
+
+```{r}
+beta_funs = list(partial(skorski, h.p=h.p_fun, h.c=h.c_fun), 
+                 partial(dumbgen, h.p=h.p_fun, h.c=h.c_fun),
+                 split)
+beta_names = c("Split TUC prediction set", "Split TUPAC prediction set", "Split conformal prediction set")
+n_beta_funs = length(beta_funs)
+```
+
+```{r}
+linear_fit = lm(V12 ~ 0 + ., data=train_df)
+```
+
+```{r}
+pred <- predict(linear_fit, newdata=conformal_df)
+residuals <- pred - conformal_df$V12
+intervals <- sapply(c(1:n_conformal), function(i) {
+  g_i = 0.85 * sqrt((log(log(exp(1) * i)) + 0.8 * log(1612/delta))/i)
+  low_prob = alpha/2 - g_i
+  high_prob = 1 - alpha/2 + g_i
+  subset_residuals = residuals[1:i]
+  interval = quantile(subset_residuals, 
+                      probs=c(max(low_prob, 0), min(high_prob, 1)), 
+                      type=1) #* c(ifelse(low_prob >= 0, 1, -Inf), ifelse(high_prob <= 1, 1, Inf))
+  if (low_prob < 0) {
+    interval[1] = -Inf
+  } 
+  if (high_prob > 1) {
+    interval[2] = Inf
+  }
+  return(interval)
+})
+res = as.data.frame(do.call("cbind", base::split(intervals, rep(c("low", "high"), length.out = n_conformal))))
+```
+
+```{r}
+test_preds = predict(linear_fit, newdata=test_df)
+coverage_fun = function(low, high, pred=test_preds) {
+  residual = pred - test_df$V12
+  return(mean((residual >= low) & (residual <= high)))
+}
+res$coverage = mapply(coverage_fun, res$low, res$high)
+res$width = res$high - res$low
+res$t = c(1:n_conformal)
+res$beta_name = "Sequential inductive prediction set"
+```
+
+```{r}
+residuals_ <- c()
+betas <- c()
+q_hats <- c()
+t_0 <- rep(1, n_beta_funs)
+for (t in 1:n_conformal) {
+  pred <- predict(linear_fit, newdata=conformal_df[t,])
+  residual <- abs(pred - conformal_df$V12[t])
+  residuals_ <- sort(c(residuals_, residual))
+  beta <- sapply(1:n_beta_funs, function(i) {beta_funs[[i]](t=t, t_0=t_0[i], alpha=alpha, delta=delta)})
+  q_hat <- ifelse(!is.na(beta) & (beta <= t), residuals_[beta], Inf)
+  t_0 <- ifelse(!is.na(beta) & (beta <= t), t_0, t+1)
+  betas <- c(betas, beta)
+  q_hats <- c(q_hats, q_hat)
+}
+res2 <- data.frame(t=rep(seq(1, n_conformal), each=n_beta_funs),
+                   betas=betas,
+                   q_hats=q_hats,
+                   beta_name=rep(beta_names, n_conformal))
+res2 <- res2 %>% 
+  left_join(res2 %>% 
+              group_by(beta_name) %>% 
+              filter(is.infinite(q_hats)) %>% 
+              summarise(t_max=max(t))) %>% 
+  mutate(q_hat_prime=ifelse(t <= t_max, Inf, q_hats))
+```
+
+```{r}
+test_preds = predict(linear_fit, newdata=test_df)
+coverage_fun2 = function(q_hat, pred=test_preds) {
+  return(mean(abs(test_df$V12 - pred) <= q_hat))
+}
+res2$coverage = sapply(res2$q_hat_prime, coverage_fun2)
+res2$width = res2$q_hat_prime * 2
+```
+
+```{r}
+result = rbind(res %>% select(c(t, beta_name, coverage, width)), 
+               res2 %>% select(c(t, beta_name, coverage, width)))
+```
+
+```{r}
+p1 = ggplot(result) +
+  geom_line(aes(x=t, y=coverage, color=beta_name)) +
+  geom_line(aes(x=t, y=1-alpha, color="Parametric")) +
+  ylab("Coverage") +
+  xlab("") +
+  scale_color_manual(name="", values=c("Split TUC prediction set"="#F8766D", 
+                                       "Split conformal prediction set"="#7CAE00",
+                                       "Split TUPAC prediction set"="#00BFC4",
+                                       "Sequential inductive prediction set"="#C77CFF",
+                                       "Parametric"="black")) +
+  scale_y_continuous(breaks=c(0.90, 0.95, 1.00)) + 
+  theme_bw(base_size=20) + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+        axis.ticks.x=element_blank(), axis.text.x=element_blank()) +
+  guides(color = guide_legend(nrow = 2))
+```
+
+```{r}
+p2 = ggplot(result) +
+  geom_line(aes(x=t, y=width, color=beta_name)) +
+  geom_line(aes(x=t, y=3.29, color="Parametric")) +
+  ylab("Width") +
+  scale_color_manual(name="", values=c("Split TUC prediction set"="#F8766D", 
+                                       "Split conformal prediction set"="#7CAE00",
+                                       "Split TUPAC prediction set"="#00BFC4",
+                                       "Sequential inductive prediction set"="#C77CFF",
+                                       "Parametric"="black")) +
+  scale_y_continuous(breaks=c(3.50, 4.25, 5.00)) + 
+  theme_bw(base_size=20) + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+```
+
+```{r}
+ggarrange(p1, p2, nrow=2, ncol=1, common.legend=TRUE, legend="bottom")
+ggsave("~/Documents/Research/Conformal/Figures/combined_simulation_all_test.png", width=12, height=7)
+```
+
+```{r}
+ggplot(res) +
+  geom_line(aes(x=t, y=width, color="DKW")) +
+  geom_line(aes(x=t, y=3.29, color="Parametric")) +
+  ylab("Width")
+```
+
+

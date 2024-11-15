@@ -1,0 +1,460 @@
+---
+title: "Spam application"
+author: "Kayla Scharfstein"
+date: "4/20/2023"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+set.seed(528)
+```
+
+
+```{r}
+library(ggplot2)
+library(e1071)
+library(VGAM)
+library(purrr)
+library(dplyr)
+library(ranger)
+library(SuperLearner)
+library(ggpubr)
+```
+
+```{r}
+spam <- read.csv("spambase.data", header=FALSE)
+```
+
+```{r}
+alpha = 0.1
+delta = 0.1
+eta = 2
+learning_rate = 1
+```
+
+```{r}
+# log pmf of discretized log normal
+h.p_fun = function(t, mu=6, sigma=1) {
+  return(plnorm(t + 1, meanlog=mu, sdlog=sigma) - plnorm(t, meanlog=mu, sdlog=sigma))
+}
+
+# upper tail of discretized log normal
+h.c_fun = function(t, mu=6, sigma=1) {
+  return(plnorm(t, lower.tail=FALSE, meanlog=mu, sdlog=sigma))
+}
+
+skorski = function(t, t_0, alpha, delta, h.p, h.c) {
+  beta = (t+1)*(1-alpha-4*(2*alpha-1)*log(h.p(t))/(3*(t+3))+
+                  sqrt(-2*alpha*(1-alpha)*log(h.p(t))/(t+2))+
+                  sqrt(pi*alpha*(1-alpha)/(2*(t+2)))*h.c(t_0))
+  return(ifelse(beta >= (t+1)*(1-alpha), ceiling(beta), Inf))
+}
+
+psi = function(x, p) {p*log(p/x) + (1-p)*log((1-p)/(1-x))}
+
+dumbgen = function(t, t_0, alpha, delta, h.p, h.c, x_grid_size=10) {
+  s = max(t_0, ceiling((t+1)*(1-alpha)))
+  if (t < s) {
+    return(Inf)
+  } else {
+    for (beta in s:t) {
+      p = beta/(t+1)
+      if (any(psi(seq(1-alpha, p, length.out=x_grid_size), p) >= 
+              (log(2*h.c(t_0)/delta) - log(h.p(t)))/(t+1))) {
+        return(beta)
+      }
+    }
+  } 
+  return(Inf)
+}
+
+split = function(t, t_0, alpha, delta) {
+  return(ceiling((t + 1)*(1-alpha)))
+}
+```
+
+```{r}
+n <- nrow(spam)
+spam <- spam[sample(1:n, n, replace=FALSE),]
+split_size <- ceiling(n/3)
+
+spam.train <- spam[1:split_size,]
+spam.test <- spam[(split_size+1):(split_size*2),]
+spam.conformal <- spam[(split_size*2 + 1):n,]
+
+n_conformal <- nrow(spam.conformal)
+```
+
+```{r}
+cols <- names(spam.train)[1:(length(spam.train) - 1)]
+
+for (col in cols) {
+  spam.train[col] <- log(0.1 + spam.train[[col]])
+  spam.test[col] <- log(0.1 + spam.test[[col]])
+  spam.conformal[col] <- log(0.1 + spam.conformal[[col]])
+}
+```
+
+```{r}
+logistic_fit <- glm(V58 ~ ., data=spam.train, family=binomial)
+rf_fit <- ranger(V58 ~ ., data=spam.train, num.trees=100, probability=T)
+sl_fit <- SuperLearner(Y=spam.train$V58, 
+                       X=spam.train[,cols], 
+                       family=binomial(), 
+                       SL.library=c("SL.glm", "SL.gam", "SL.ranger", "SL.ksvm"))
+```
+
+```{r}
+beta_funs = list(partial(skorski, h.p=h.p_fun, h.c=h.c_fun), 
+                 partial(dumbgen, h.p=h.p_fun, h.c=h.c_fun),
+                 split)
+beta_names = c("Split TUC prediction set",
+               "Split TUPAC prediction set",
+               "Split conformal prediction set")
+n_beta_funs = length(beta_funs)
+
+pred_funs = list(logistic_fit, rf_fit, sl_fit)
+pred_fun_methods = list(function(data) {predict(logistic_fit, newdata=data, type="response")},
+                        function(data) {predict(rf_fit, data=data, type="response")$predictions[,2]},
+                        function(data) {predict(sl_fit, data[,cols])$pred})
+pred_names = c("Logistic regression", "Random forest", "Superlearner")
+n_pred_funs = length(pred_funs)
+```
+
+```{r}
+# res = data.frame(low=c(), high=c())
+# for (p in 1:n_pred_funs) {
+#   preds = pred_fun_methods[[p]](spam.conformal)
+#   residuals = preds - spam.conformal$V58
+#   intervals <- sapply(c(1:n_conformal), function(i) {
+#     g_i = 0.85 * sqrt((log(log(exp(1) * i)) + 0.8 * log(1612/delta))/i)
+#     low_prob = alpha/2 - g_i
+#     high_prob = 1 - alpha/2 + g_i
+#     subset_residuals = residuals[1:i]
+#     interval = quantile(subset_residuals,
+#                         probs=c(max(low_prob, 0), min(high_prob, 1)),
+#                         type=1)
+#     if (low_prob < 0) {
+#       interval[1] = -Inf
+#     }
+#     if (high_prob > 1) {
+#       interval[2] = Inf
+#     }
+#     return(interval)
+#   })
+#   res = rbind(res, as.data.frame(do.call("cbind", base::split(intervals, rep(c("low", "high"), length.out = n_conformal)))))
+# }
+# res$pred_name = rep(pred_names, each=n_conformal)
+```
+
+```{r}
+# test_preds = sapply(1:n_pred_funs, function(i) {pred_fun_methods[[i]](spam.test)})
+# coverage_fun = function(low, high, pred) {
+#   residual = pred - spam.test$V58
+#   return(mean((residual >= low) & (residual <= high)))
+# }
+# res$coverage = mapply(coverage_fun, 
+#                       res$low, 
+#                       res$high,
+#                       lapply(res$pred_name, function(pred_name) {test_preds[,which(pred_names==pred_name)]}))
+# size_fun = function(low, high, pred=test_pred) {
+#   return(mean(((pred - 1) >= low) & (pred <= high)))
+# }
+# res$prop_full = mapply(size_fun, 
+#                        res$low,
+#                        res$high,
+#                        lapply(res$pred_name, function(pred_name) {test_preds[,which(pred_names==pred_name)]}))
+# res$beta_name = "Sequential inductive prediction set"
+# res$t = rep(seq(1, nrow(spam.conformal)), each=n_pred_funs)
+```
+
+```{r}
+residual_mat <- matrix(ncol=n_pred_funs)
+betas <- c()
+q_hats <- c()
+t_0 <- matrix(data=1, n_beta_funs, n_pred_funs)
+for (t in 1:nrow(spam.conformal)) {
+  preds <- sapply(1:n_pred_funs, function(i) {pred_fun_methods[[i]](spam.conformal[t,])})
+  residuals <- abs(preds - spam.conformal$V58[t])
+  residual_mat <- apply(rbind(residual_mat, residuals), 2, sort)
+  beta <- outer(1:n_beta_funs, 
+                1:n_pred_funs, 
+                Vectorize(function(i, j) {beta_funs[[i]](t=t, t_0=t_0[i, j], alpha=alpha, delta=delta)}))
+  beta_flat <- as.vector(beta)
+  q_hat_flat <- ifelse((beta_flat <= t) & !is.na(beta_flat), residual_mat[beta_flat + rep(0:(n_pred_funs-1) * t, each=n_beta_funs)], Inf)
+  t_0 <- t_0 + ((beta > t) | is.na(beta))
+  betas <- c(betas, beta_flat)
+  q_hats <- c(q_hats, q_hat_flat)
+}
+res2 <- data.frame(t=rep(seq(1, nrow(spam.conformal)), each=n_beta_funs*n_pred_funs),
+                   betas=betas,
+                   q_hats=q_hats,
+                   beta_name=rep(beta_names, n_pred_funs*nrow(spam.conformal)),
+                   pred_name=rep(rep(pred_names, each=n_beta_funs), nrow(spam.conformal)))
+res2 <- res2 %>% 
+  left_join(res2 %>% 
+              group_by(beta_name, pred_name) %>% 
+              filter(is.infinite(q_hats)) %>% 
+              summarise(t_max=max(t))) %>% 
+  mutate(q_hat_prime=ifelse(t <= t_max, Inf, q_hats))
+```
+
+```{r}
+test_preds = sapply(1:n_pred_funs, function(i) {pred_fun_methods[[i]](spam.test)})
+coverage_fun = function(q_hat, pred) {
+  return(mean(abs(spam.test$V58 - pred) <= q_hat))
+}
+res2$coverage = mapply(coverage_fun, 
+                       res2$q_hat_prime, 
+                       lapply(res2$pred_name, function(pred_name) {test_preds[,which(pred_names==pred_name)]}))
+size_fun = function(q_hat, pred=test_pred) {
+  return(mean(((1 - pred) <= q_hat) & (pred <= q_hat)))
+}
+res2$prop_full = mapply(size_fun, 
+                        res2$q_hat_prime, 
+                        lapply(res2$pred_name, function(pred_name) {test_preds[,which(pred_names==pred_name)]}))
+```
+
+```{r}
+# result = rbind(res %>% select(c(t, beta_name, coverage, width)), 
+#                res2 %>% select(c(t, beta_name, coverage, width)))
+```
+
+```{r}
+p1 = ggplot(res2) +
+  geom_line(aes(x=t, y=coverage, color=beta_name, linetype=pred_name)) +
+  geom_hline(yintercept=1-alpha, color="black") +
+  ylab("Coverage") +
+  xlab("") +
+  ylim(0.85, 1) +
+  scale_color_discrete(name="") +
+  scale_linetype_discrete(name="") + 
+  theme_bw(base_size=20) + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+        axis.ticks.x=element_blank(), axis.text.x=element_blank())
+```
+
+```{r}
+p2 = ggplot(res2) +
+  geom_line(aes(x=t, y=prop_full, color=beta_name, linetype=pred_name)) +
+  ylim(0, 1) +
+  ylab("Proportion of full prediction sets") +
+  scale_color_discrete(name="") +
+  scale_linetype_discrete(name="") + 
+  theme_bw(base_size=20) + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+```
+
+```{r}
+ggarrange(p1, p2, ncol=1, nrow=2, common.legend=TRUE, legend="bottom")
+```
+
+
+```{r}
+dynamic_skorski = function(t, k, t_k, alpha, delta, h.p, h.c, g.p) {
+  curr_size = t-ceiling(eta^k)+1
+  beta = (curr_size+1)*(1-alpha-(4*(2*alpha-1)*log(h.p(curr_size)))/(3*(curr_size+3))+
+                          sqrt(-2*alpha*(1-alpha)*log(h.p(curr_size))/(curr_size+2))+
+                          sqrt((2*alpha*(1-alpha)*log((h.c(t_k) - h.c(floor(eta^(k+2))))/g.p(k)))/
+                                  (curr_size + 2))+sqrt((pi*alpha*(1-alpha))/(2*(curr_size+2))))
+  return(ifelse(beta >= (curr_size + 1)*(1-alpha), ceiling(beta), Inf))
+}
+
+dynamic_dumbgen = function(t, k, t_k, alpha, delta, h.p, h.c, g.p, x_grid_size=10) {
+  curr_size = t-ceiling(eta^k)+1
+  s = max(t_k-ceiling(eta^k)+1, ceiling((curr_size+1)*(1-alpha)))
+  if (s > curr_size) {
+    return(Inf)
+  } else {
+    for (beta in s:curr_size) {
+      p = beta/(curr_size+1)
+      if (any(psi(seq(1-alpha, p, length.out=x_grid_size), p) >= 
+              (log(2*(h.c(t_k) - h.c(floor(eta^(k+2))))/(delta * g.p(k))) - log(h.p(curr_size)))/(curr_size+1))) {
+        return(beta)
+      }
+    }
+  } 
+  return(Inf)
+}
+```
+
+```{r}
+beta_funs <- list(partial(dynamic_skorski, 
+                          h.p=h.p_fun, 
+                          h.c=h.c_fun, 
+                          g.p=partial(h.p_fun, mu=log(8))), 
+                  partial(dynamic_dumbgen, 
+                          h.p=h.p_fun, 
+                          h.c=h.c_fun,
+                          g.p=partial(h.p_fun, mu=log(8))))
+beta_names <- c(paste0((1-alpha)*100, "% dynamic anytime conformal prediction set"),
+                paste0("Dynamic anytime (", alpha, ", ", delta, ")-PAC prediction set"))
+n_beta_funs <- length(beta_funs)
+```
+
+```{r}
+logistic_prob = function(x, w) {
+  return(1/(1 + exp(-x %*% w)))
+}
+
+logistic_grad = function(x, y, w) {
+  h = logistic_prob(x, w)
+  return(x %*% (h - y))
+}
+```
+
+```{r}
+spam.conformal <- rbind(spam.train, spam.conformal)
+spam.conformal <- cbind(rep(1, nrow(spam.conformal)), spam.conformal)
+names(spam.conformal)[1] <- "b"
+cols <- names(spam.conformal)[1:(length(spam.conformal) - 1)]
+spam.test <- cbind(rep(1, nrow(spam.test)), spam.test)
+names(spam.test)[1] <- "b"
+```
+
+```{r}
+coverage_fun = function(q_hat, pred) {
+  return(mean(abs(spam.test$V58 - pred) <= q_hat))
+}
+size_fun = function(q_hat, pred) {
+  return(mean(((1 - pred) <= q_hat) & (pred <= q_hat)))
+}
+```
+
+```{r}
+k = 0
+w_curr = rep(0, length(cols))
+w_prev = rep(0, length(cols))
+residuals_prev = c()
+residuals_curr = c()
+t_0_prev = rep(1, n_beta_funs)
+t_0_curr = rep(1, n_beta_funs)
+model_prev = NA
+model_curr = NA
+test_preds_prev = rep(0.5, nrow(spam.test))
+test_preds_curr = rep(0.5, nrow(spam.test))
+coverage_fun_prev = partial(coverage_fun, pred=test_preds_prev)
+coverage_fun_curr = partial(coverage_fun, pred=test_preds_curr)
+size_fun_prev = partial(size_fun, pred=test_preds_prev)
+size_fun_curr = partial(size_fun, pred=test_preds_curr)
+res = data.frame(t=c(),
+                 beta_prevs=c(),
+                 beta_currs=c(),
+                 q_hat_prevs=c(),
+                 q_hat_currs=c(),
+                 t_k_prevs=c(),
+                 t_k_currs=c(),
+                 beta_name=c())
+for (t in 1:nrow(spam.conformal)) {
+  if (t >= eta^(k+1)) {
+    k = k+1
+    # w_prev = w_curr
+    # for (s in ceiling(eta^(k-1)):(t-1)) {
+    #   w_curr = w_curr - learning_rate * logistic_grad(as.numeric(spam.conformal[s,cols]), spam.conformal$V58[s], w_curr)
+    # }
+    model_prev = model_curr
+    model_curr = glm(V58 ~ ., data=spam.conformal[1:(t-1),], family=binomial)
+    test_preds_prev = test_preds_curr
+    test_preds_curr = predict(model_curr, newdata=spam.test, type="response")
+    coverage_fun_prev = partial(coverage_fun, pred=test_preds_prev)
+    coverage_fun_curr = partial(coverage_fun, pred=test_preds_curr)
+    size_fun_prev = partial(size_fun, pred=test_preds_prev)
+    size_fun_curr = partial(size_fun, pred=test_preds_curr)
+    residuals_prev = residuals_curr
+    residuals_curr = c()
+    t_0_prev = t_0_curr
+    t_0_curr = rep(t, n_beta_funs)
+  }
+  # pred_prev = logistic_prob(as.numeric(spam.conformal[t, cols]), w_prev)
+  # pred_curr = logistic_prob(as.numeric(spam.conformal[t, cols]), w_curr)
+  if (is.na(model_prev)) {
+    pred_prev = 0.5
+  } else {
+    pred_prev = predict(model_prev, newdata=spam.conformal[t,], type="response")
+  } 
+  if (is.na(model_prev)) {
+    pred_curr = 0.5
+  } else {
+    pred_curr = predict(model_curr, newdata=spam.conformal[t,], type="response")
+  } 
+  residuals_prev = sort(c(residuals_prev, abs(pred_prev - spam.conformal$V58[t])))
+  residuals_curr = sort(c(residuals_curr, abs(pred_curr - spam.conformal$V58[t])))
+  beta_prev = sapply(1:n_beta_funs, 
+                     function(i) {beta_funs[[i]](t=t, k=k-1, t_k=t_0_prev[i], alpha=alpha, delta=delta)})
+  beta_curr = sapply(1:n_beta_funs, 
+                     function(i) {beta_funs[[i]](t=t, k=k, t_k=t_0_curr[i], alpha=alpha, delta=delta)})
+  q_hat_prev = ifelse((beta_prev <= (t - ceiling(eta^(k-1)) + 1)) & !is.na(beta_prev), 
+                      residuals_prev[beta_prev], Inf)
+  q_hat_curr = ifelse((beta_curr <= (t - ceiling(eta^(k)) + 1)) & !is.na(beta_curr), 
+                      residuals_curr[beta_curr], Inf)
+  coverage_prev = sapply(q_hat_prev, coverage_fun_prev)
+  coverage_curr = sapply(q_hat_curr, coverage_fun_curr)
+  size_prev = sapply(q_hat_prev, size_fun_prev)
+  size_curr = sapply(q_hat_curr, size_fun_curr)
+  res = rbind(res, data.frame(t=rep(t, n_beta_funs),
+                              k=rep(k, n_beta_funs),
+                              beta_prevs=beta_prev,
+                              beta_currs=beta_curr,
+                              q_hat_prevs=q_hat_prev,
+                              q_hat_currs=q_hat_curr,
+                              t_k_prevs=t_0_prev,
+                              t_k_currs=t_0_curr,
+                              coverage_prevs=coverage_prev,
+                              coverage_currs=coverage_curr,
+                              size_prevs=size_prev,
+                              size_currs=size_curr,
+                              beta_name=beta_names))
+  t_0_prev = t_0_prev + ((beta_prev > (t - ceiling(eta^(k-1)) + 1)) | is.na(beta_prev))
+  t_0_curr = t_0_curr + ((beta_curr > (t - ceiling(eta^k) + 1)) | is.na(beta_curr))
+}
+```
+
+```{r}
+res <- res %>% 
+  left_join(res %>% 
+              group_by(beta_name, k) %>% 
+              filter(is.infinite(q_hat_prevs)) %>% 
+              summarise(t_max_prev=max(t))) %>% 
+  left_join(res %>% group_by(beta_name, k) %>% 
+              filter(is.infinite(q_hat_currs)) %>% 
+              summarise(t_max_curr=max(t))) %>% 
+  mutate(q_hat_prev_prime=ifelse(t <= t_max_prev, Inf, q_hat_prevs), 
+         q_hat_curr_prime=ifelse(t <= t_max_curr, Inf, q_hat_currs))
+```
+
+```{r}
+p3 = ggplot(res) + 
+  geom_line(aes(x=t, 
+                y=pmin(coverage_prevs, pmax(is.infinite(q_hat_curr_prime), coverage_currs)),
+                color=beta_name)) +
+  labs(y="Coverage", x="") +
+  geom_hline(yintercept=1-alpha) +
+  geom_vline(xintercept=eta^seq(0, 11, by=1), linetype="dashed") + 
+  scale_color_discrete(name="") +
+  ylim(0.85, 1) +
+  theme_bw(base_size=20) + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+        axis.ticks.x=element_blank(), axis.text.x=element_blank())
+```
+
+```{r}
+p4 = ggplot(res) + 
+  geom_line(aes(x=t, 
+                y=pmin(size_prevs, pmax(is.infinite(q_hat_curr_prime), size_currs)),
+                color=beta_name)) +
+  labs(x="t", y="Proportion of full prediction sets") +
+  geom_vline(xintercept=eta^seq(0, 11, by=1), linetype="dashed") + 
+  scale_color_discrete(name="") +
+  ylim(0, 1) +
+  theme_bw(base_size=20) + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+```
+
+```{r}
+ggarrange(p3, p4, ncol=1, nrow=2, common.legend=TRUE, legend="bottom")
+```
+
